@@ -115,6 +115,9 @@ func CallDistributeMapTask(mapFunc func(string, string) []KeyValue) bool {
 
 	var intermediateFiles []string
 	for reduceNumber, kvs := range dict {
+		if len(kvs) == 0 {
+			continue
+		}
 		intermediateFileName := fmt.Sprintf("mr-%d-%d", mapNumber, reduceNumber)
 		intermediateFiles = append(intermediateFiles, intermediateFileName)
 		ifile, _ := os.Create(intermediateFileName)
@@ -125,7 +128,7 @@ func CallDistributeMapTask(mapFunc func(string, string) []KeyValue) bool {
 		ifile.Close()
 	}
 
-	CallCompleteMapTask(mapNumber, intermediateFiles)
+	go CallCompleteMapTask(mapNumber, intermediateFiles)
 	return true
 }
 
@@ -198,7 +201,7 @@ func CallDistributeReduceTask(reduceFunc func(string, []string) string) bool {
 	}
 	ofile.Close()
 
-	CallCompleteReduceTask(reduceNumber)
+	go CallCompleteReduceTask(reduceNumber)
 	return true
 }
 

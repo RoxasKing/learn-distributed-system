@@ -31,9 +31,11 @@ type Master struct {
 	workers map[worker]struct{} // Used to broadcast workers
 
 	nReduce int
-	isOver  bool
 
-	sync.Mutex
+	isMapTaskOver    bool
+	isReduceTaskOver bool
+
+	mu sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -42,7 +44,7 @@ type Master struct {
 func (m *Master) broadcast() {
 	// Wait for all map task finished
 	var wgMap sync.WaitGroup
-	for taskNumber := range m.mapSuccessSign {
+	for taskNumber := range m.mapTaskDone {
 		wgMap.Add(1)
 		go func(taskNumber int) {
 			defer wgMap.Done()
@@ -67,17 +69,19 @@ func (m *Master) broadcast() {
 		}
 	}
 
-	m.Lock()
+	m.mu.Lock()
 	// Remind all workers to start reduce
 	for worker := range m.workers {
 		worker <- struct{}{}
 		delete(m.workers, worker)
 	}
-	m.Unlock()
+
+	m.isMapTaskOver = true
+	m.mu.Unlock()
 
 	// Wait for all reduce task finished
 	var wgReduce sync.WaitGroup
-	for taskNumber := range m.reduceSuccessSign {
+	for taskNumber := range m.reduceTaskDone {
 		wgReduce.Add(1)
 		go func(taskNumber int) {
 			defer wgReduce.Done()
@@ -88,7 +92,7 @@ func (m *Master) broadcast() {
 
 	close(m.reduceTaskQueue)
 
-	m.Lock()
+	m.mu.Lock()
 	// Remind all workers to quit
 	for worker := range m.workers {
 		worker <- struct{}{}
@@ -96,8 +100,8 @@ func (m *Master) broadcast() {
 	}
 
 	// Completion of work
-	m.isOver = true
-	m.Unlock()
+	m.isReduceTaskOver = true
+	m.mu.Unlock()
 }
 
 // Distribute a map task to a worker node
@@ -120,10 +124,14 @@ func (m *Master) DistributeMapTask(args *MapArgs, reply *MapReply) error {
 		select {
 		case <-m.mapSuccessSign[taskNumber]:
 			m.mapTaskDone[taskNumber] <- struct{}{}
+			// DEBUG
+			// log.Printf("map task %d success\n", taskNumber)
 		case <-t.C:
 			// If a task hasn't completed its task after 10 second,
 			// putting this task back in the queue
 			m.mapTaskQueue <- taskNumber
+			// DEBUG
+			// log.Printf("map task %d failed\n", taskNumber)
 		}
 	}()
 
@@ -139,13 +147,20 @@ func (m *Master) CompleteMapTask(args *MapArgs, reply *MapReply) error {
 	return nil
 }
 
-// Register a worker channerl, and wait for receiving a reduce signal
+// Register a worker channel, and wait for receiving a reduce signal
 func (m *Master) WaitForReduce(args *MapArgs, reply *MapReply) error {
-	ch := make(chan struct{})
 
-	m.Lock()
+	m.mu.Lock()
+
+	// If map tasks is over, skip wait
+	if m.isMapTaskOver {
+		m.mu.Unlock()
+		return nil
+	}
+
+	ch := make(chan struct{})
 	m.workers[ch] = struct{}{}
-	m.Unlock()
+	m.mu.Unlock()
 
 	<-ch
 
@@ -170,10 +185,14 @@ func (m *Master) DistributeReduceTask(args *ReduceArgs, reply *ReduceReply) erro
 		select {
 		case <-m.reduceSuccessSign[taskNumber]:
 			m.reduceTaskDone[taskNumber] <- struct{}{}
+			// DEBUG
+			// log.Printf("reduce task %d success\n", taskNumber)
 		case <-t.C:
 			// If a task hasn't completed its task after 10 second,
 			// putting this task back in the queue
 			m.reduceTaskQueue <- taskNumber
+			// DEBUG
+			// log.Printf("reduce task %d failed\n", taskNumber)
 		}
 	}()
 
@@ -190,11 +209,18 @@ func (m *Master) CompleteReduceTask(args *ReduceArgs, reply *ReduceReply) error 
 
 // Register a worker channerl, and wait for quit
 func (m *Master) WaitForFinish(args *ReduceArgs, reply *ReduceReply) error {
-	ch := make(chan struct{})
 
-	m.Lock()
+	m.mu.Lock()
+
+	// If reduce tasks is over, skip wait
+	if m.isReduceTaskOver {
+		m.mu.Unlock()
+		return nil
+	}
+
+	ch := make(chan struct{})
 	m.workers[ch] = struct{}{}
-	m.Unlock()
+	m.mu.Unlock()
 
 	<-ch
 
@@ -237,9 +263,9 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
-	m.Lock()
-	ret = m.isOver
-	m.Unlock()
+	m.mu.Lock()
+	ret = m.isReduceTaskOver
+	m.mu.Unlock()
 
 	return ret
 }
