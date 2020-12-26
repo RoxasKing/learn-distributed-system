@@ -708,23 +708,11 @@ func (rf *Raft) appendEntriesHandle(args *AppendEntriesArgs) *AppendEntriesReply
 
 	// if LeaderCommit > commitIndex , set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {
-		newCommitIndex := Min(args.LeaderCommit, indexOfLastNewEntry)
+		rf.commitIndex = Min(args.LeaderCommit, indexOfLastNewEntry)
+	}
 
-		l := rf.commitIndex + 1 - startIndex
-		r := newCommitIndex - startIndex
-		newCommitEntries := make([]*Entry, len(rf.logs[l:r+1]))
-		copy(newCommitEntries, rf.logs[l:r+1])
-
-		// update commitIndex
-		rf.commitIndex = newCommitIndex
-
-		// TODO
-		if rf.commitIndex > rf.lastApplied {
-			rf.lastApplied = rf.commitIndex
-		}
-
-		// send apply message
-		sendApplyMessage(rf.me, newCommitEntries, rf.applyCh)
+	if rf.commitIndex > rf.lastApplied {
+		rf.sendApplyMessage()
 	}
 
 	return &AppendEntriesReply{Term: rf.currentTerm, Success: true}
@@ -885,35 +873,21 @@ func (rf *Raft) appendEntriesReplyHandle(index int, args *AppendEntriesArgs, rep
 		DPrintf("----majorityMatchIndex:%v, commitIndex:%v----\n", majorityMatchIndex, rf.commitIndex)
 
 		if majorityMatchIndex > rf.commitIndex {
-			startIndex := rf.logs[0].Index
 
 			// only commit current term's log
-			if rf.logs[majorityMatchIndex-startIndex].Term != rf.currentTerm {
-				return
-			}
-
-			// get new commited entries
-			l, r := 0, 0
-			if rf.commitIndex > 0 {
-				l = rf.commitIndex + 1 - startIndex
-			}
-			r = majorityMatchIndex - startIndex
-			newCommitEntries := make([]*Entry, len(rf.logs[l:r+1]))
-			copy(newCommitEntries, rf.logs[l:r+1])
+			// if rf.logs[majorityMatchIndex-startIndex].Term != rf.currentTerm {
+			// 	return
+			// }
 
 			// update commitIndex
 			rf.commitIndex = majorityMatchIndex
 
 			// broadcast new commit index
 			rf.sendHeartbeatImmediately()
+		}
 
-			// TODO
-			if rf.commitIndex > rf.lastApplied {
-				rf.lastApplied = rf.commitIndex
-			}
-
-			// send applyCh
-			sendApplyMessage(rf.me, newCommitEntries, rf.applyCh)
+		if rf.commitIndex > rf.lastApplied {
+			rf.sendApplyMessage()
 		}
 
 		return
@@ -924,14 +898,22 @@ func (rf *Raft) appendEntriesReplyHandle(index int, args *AppendEntriesArgs, rep
 	rf.nextIndexs[index] = reply.LastLogIndex + 1
 }
 
-func sendApplyMessage(server int, entries []*Entry, ch chan ApplyMsg) {
-	for _, entry := range entries {
-		ch <- ApplyMsg{
+func (rf *Raft) sendApplyMessage() {
+	startIndex := rf.logs[0].Index
+	l, r := 0, 0
+	if rf.lastApplied > 0 {
+		l = rf.lastApplied + 1 - startIndex
+	}
+	r = rf.commitIndex - startIndex
+
+	for _, entry := range rf.logs[l : r+1] {
+		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
-		DPrintf("{%d} APPLY index:%v term:%v command:%v\n", server, entry.Index, entry.Term, entry.Command)
+		DPrintf("{%d} APPLY index:%v term:%v command:%v\n", rf.me, entry.Index, entry.Term, entry.Command)
+		rf.lastApplied++
 	}
 }
 
