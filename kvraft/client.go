@@ -3,7 +3,7 @@ package kvraft
 import (
 	"crypto/rand"
 	"math/big"
-	"sync"
+	"time"
 
 	"github.com/RoxasKing/learn-distributed-system/labrpc"
 )
@@ -12,7 +12,6 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	leaderId int
-	mu       sync.Mutex
 }
 
 func nrand() int64 {
@@ -26,7 +25,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	ck.leaderId = -1
+	ck.leaderId = 0
 	return ck
 }
 
@@ -51,28 +50,16 @@ func (ck *Clerk) Get(key string) string {
 		Uid: nrand(),
 	}
 
-	serverId := 0
-
-	ck.mu.Lock()
-	if ck.leaderId != -1 {
-		serverId = ck.leaderId
-	}
-	ck.mu.Unlock()
-
 	for {
-		DPrintf("[Clerk] Calling  (%v) (%v)\n", args.Uid, "Get")
+		DPrintf("[Clerk] Calling  (%v) (%v) (%v)\n", args.Uid, "Get", key)
 		reply := &GetReply{}
-		if ok := ck.servers[serverId].Call("KVServer.Get", args, reply); ok && reply.Err != ErrWrongLeader {
-
-			ck.mu.Lock()
-			ck.leaderId = serverId // remember the current leaderId
-			ck.mu.Unlock()
-
-			DPrintf("[Clerk] Finished (%v) (%v)\n", args.Uid, "Get")
+		if ok := ck.servers[ck.leaderId].Call("KVServer.Get", args, reply); ok && reply.Err != ErrWrongLeader {
+			DPrintf("[Clerk] Finished (%v) (%v) (%v)\n", args.Uid, "Get", key)
 			return reply.Value
 		}
 
-		serverId = (serverId + 1) % len(ck.servers)
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(12 * time.Millisecond)
 	}
 
 }
@@ -97,28 +84,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Uid:   nrand(),
 	}
 
-	serverId := 0
-
-	ck.mu.Lock()
-	if ck.leaderId != -1 {
-		serverId = ck.leaderId
-	}
-	ck.mu.Unlock()
-
 	for {
-		DPrintf("[Clerk] Calling  (%v) (%v)\n", args.Uid, op)
+		DPrintf("[Clerk] Calling  (%v) (%v) (%v) (%v)\n", args.Uid, op, key, value)
 		reply := &PutAppendReply{}
-		if ok := ck.servers[serverId].Call("KVServer.PutAppend", args, reply); ok && reply.Err == OK {
-
-			ck.mu.Lock()
-			ck.leaderId = serverId // remember the current leaderId
-			ck.mu.Unlock()
-
-			DPrintf("[Clerk] Finished (%v) (%v)\n", args.Uid, op)
+		if ok := ck.servers[ck.leaderId].Call("KVServer.PutAppend", args, reply); ok && reply.Err == OK {
+			DPrintf("[Clerk] Finished (%v) (%v) (%v) (%v)\n", args.Uid, op, key, value)
 			return
 		}
 
-		serverId = (serverId + 1) % len(ck.servers)
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		time.Sleep(12 * time.Millisecond)
 	}
 
 }

@@ -1,10 +1,10 @@
 package kvraft
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"sync/atomic"
-	"time"
 
 	"github.com/RoxasKing/learn-distributed-system/labgob"
 	"github.com/RoxasKing/learn-distributed-system/labrpc"
@@ -35,16 +35,10 @@ type replyMsg struct {
 	val string
 }
 
-type subInfo struct {
-	idx int
-	uid int64
-	typ string
-	key string
-}
-
-type subReq struct {
-	ch   chan replyMsg
-	info subInfo
+type replyInfo struct {
+	idx int           // start return's index
+	op  Op            // opration
+	ch  chan replyMsg // reply channel
 }
 
 type KVServer struct {
@@ -57,14 +51,20 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore   map[string]string         // store key-value pair
-	subReqCh  chan subReq               // recieve subscribe request
-	subscribe map[chan replyMsg]subInfo // subscribe applyMsg
-	uidList   []int64                   // store every cmd's uid
-	excutedOp map[int64]bool            // avoid execute twice
-	killCtx   context.Context           // receive a message that kills all for select loop
-	killFunc  func()                    // methods for killing all for select loops
-	waitCh    chan struct{}             // if linearizability is required, use it
+	persister   *raft.Persister   // for snapshot
+	kvStore     map[string]string // store key-value pair
+	excutedCmd  map[int64]bool    // avoid duplicate request
+	uidList     []int64           // latest executed opration's uid
+	lastOpIndex int               // last executed opration's index
+	lastOpTerm  int               // last executed opration's term
+	replyQueue  []*replyInfo      // list of replyInfo
+	replyCh     chan *replyInfo   // receive replyInfo
+	waitCh      chan struct{}     // ensure that requests join the queue in order
+	snapshotCh  chan struct{}     // start snapshot signal
+	snapshoting bool              // if snapshot is not finished, value is true
+	killCtx     context.Context   // receive a message that kills all for select loop
+	killFunc    func()            // methods for killing all for select loops
+
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -142,18 +142,26 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
+	kv.persister = persister
+
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
 	kv.kvStore = make(map[string]string)
-	kv.subReqCh = make(chan subReq)
-	kv.subscribe = make(map[chan replyMsg]subInfo)
+	kv.excutedCmd = make(map[int64]bool)
 	kv.uidList = []int64{}
-	kv.excutedOp = make(map[int64]bool)
-	kv.killCtx, kv.killFunc = context.WithCancel(context.Background())
+	kv.lastOpIndex = 0
+	kv.lastOpTerm = 0
+	kv.replyQueue = []*replyInfo{}
+	kv.replyCh = make(chan *replyInfo)
 	kv.waitCh = make(chan struct{}, 1)
+	kv.snapshotCh = make(chan struct{})
+	kv.snapshoting = false
+	kv.killCtx, kv.killFunc = context.WithCancel(context.Background())
+
+	// initialize from snapshot before a crash
+	kv.readSnapshot(persister.ReadSnapshot())
 
 	go run(kv)
 
@@ -163,23 +171,30 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func run(kv *KVServer) {
 	for {
 		select {
-		case req := <-kv.subReqCh:
-			kv.subReqHandle(req)
+		case info := <-kv.replyCh:
+			kv.pushToReplyQueue(info)
+
 		case msg := <-kv.applyCh:
 			kv.applyHandle(msg)
+
+		case <-kv.snapshotCh:
+			kv.makeSnapshot(kv.lastOpIndex, kv.lastOpTerm)
+
 		case <-kv.killCtx.Done():
+			kv.rejectAllRequest()
+			DPrintf("KVServer {%d} killed!\n", kv.me)
 			return
 		}
 	}
 }
 
 func (kv *KVServer) oprationHandle(op Op) replyMsg {
-	// kv.waitCh <- struct{}{}
-	// defer func() { <-kv.waitCh }()
+	kv.waitCh <- struct{}{}
 
 	index, _, isLeader := kv.rf.Start(op)
 
 	if !isLeader || index == -1 {
+		<-kv.waitCh
 		return replyMsg{err: ErrWrongLeader}
 	}
 
@@ -187,82 +202,127 @@ func (kv *KVServer) oprationHandle(op Op) replyMsg {
 
 	ch := make(chan replyMsg, 1)
 
-	kv.subReqCh <- subReq{
-		ch: ch,
-		info: subInfo{
-			idx: index,
-			uid: op.Uid,
-			typ: op.Typ,
-			key: op.Key,
-		},
+	kv.replyCh <- &replyInfo{
+		idx: index,
+		op:  op,
+		ch:  ch,
 	}
+	<-kv.waitCh
 
-	// Warn: avoid wait too long
-	select {
-	case msg := <-ch:
-		return replyMsg{msg.err, msg.val}
-	case <-time.After(1 * time.Second):
-		return replyMsg{err: ErrWrongLeader}
-	}
+	msg := <-ch
+	return replyMsg{msg.err, msg.val}
 }
 
-func (kv *KVServer) subReqHandle(req subReq) {
-	ch, info := req.ch, req.info
-
-	if len(kv.uidList) < info.idx {
-		kv.subscribe[ch] = info
+func (kv *KVServer) pushToReplyQueue(info *replyInfo) {
+	if info.idx == kv.lastOpIndex {
+		if info.op.Typ == "Get" {
+			info.ch <- replyMsg{err: OK, val: kv.kvStore[info.op.Key]}
+		} else {
+			info.ch <- replyMsg{err: OK}
+		}
 		return
 	}
 
-	if kv.uidList[req.info.idx-1] != req.info.uid {
-		req.ch <- replyMsg{err: ErrWrongLeader}
-		return
-	}
-
-	if info.typ == "Get" {
-		req.ch <- replyMsg{err: OK, val: kv.kvStore[info.key]}
-	} else {
-		req.ch <- replyMsg{err: OK}
-	}
+	kv.replyQueue = append(kv.replyQueue, info)
 }
 
 func (kv *KVServer) applyHandle(msg raft.ApplyMsg) {
 	if !msg.CommandValid {
+		if msg.StateChange {
+			kv.rejectAllRequest()
+			return
+		}
+		kv.readSnapshot(msg.Snapshot)
+		kv.snapshoting = false
 		return
 	}
 
-	idx := msg.CommandIndex
 	op, _ := msg.Command.(Op)
 
-	defer DPrintf("Server {%d} Apply (%v) (%v) (%v)", kv.me, op.Uid, op.Typ, msg.CommandIndex)
-
-	if !kv.excutedOp[op.Uid] {
+	if !kv.excutedCmd[op.Uid] && op.Typ != "Get" {
 		switch op.Typ {
 		case "Put":
 			kv.kvStore[op.Key] = op.Val
 		case "Append":
 			kv.kvStore[op.Key] += op.Val
 		}
+		kv.excutedCmd[op.Uid] = true
 		kv.uidList = append(kv.uidList, op.Uid)
-		kv.excutedOp[op.Uid] = true
+		if len(kv.uidList) > 49 {
+			kv.uidList = kv.uidList[1:]
+		}
 	}
 
-	for ch, info := range kv.subscribe {
-		if info.idx != idx {
-			continue
-		}
-		delete(kv.subscribe, ch)
+	kv.lastOpIndex = msg.CommandIndex
+	kv.lastOpTerm = msg.CommandTerm
 
-		if info.uid != op.Uid {
-			ch <- replyMsg{err: ErrWrongLeader}
-			return
-		}
-
-		if info.typ == "Get" {
+	if len(kv.replyQueue) > 0 && kv.replyQueue[0].idx == msg.CommandIndex {
+		ch := kv.replyQueue[0].ch
+		if op.Typ == "Get" {
 			ch <- replyMsg{err: OK, val: kv.kvStore[op.Key]}
 		} else {
 			ch <- replyMsg{err: OK}
 		}
+		kv.replyQueue = kv.replyQueue[1:]
+	}
+
+	if msg.IsLeader && !kv.snapshoting && kv.maxraftstate > 0 && kv.persister.RaftStateSize() >= kv.maxraftstate*2 {
+		go func() { kv.snapshotCh <- struct{}{} }()
+		kv.snapshoting = true
+	}
+
+	DPrintf("Server {%d} Apply (%v) (%v) (%v)", kv.me, op.Uid, op.Typ, msg.CommandIndex)
+}
+
+func (kv *KVServer) makeSnapshot(lastIncludedIndex, lastIncludedTerm int) {
+	w := new(bytes.Buffer)
+	d := labgob.NewEncoder(w)
+	_ = d.Encode(lastIncludedIndex)
+	_ = d.Encode(lastIncludedTerm)
+	_ = d.Encode(kv.kvStore)
+	_ = d.Encode(kv.uidList)
+	data := w.Bytes()
+
+	go kv.rf.LogCompaction(lastIncludedIndex, lastIncludedTerm, data)
+
+	DPrintf("Server {%d} make snapshot, size(%d), lastIndex(%d)\n", kv.me, len(data), lastIncludedIndex)
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
 		return
 	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastIncludedIndex, lastIncludedTerm int
+	var kvStore map[string]string
+	var uidList []int64
+
+	if d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&kvStore) != nil ||
+		d.Decode(&uidList) != nil {
+		return
+	}
+
+	// snapshot is newer than current state
+	if lastIncludedIndex > kv.lastOpIndex {
+		kv.kvStore = kvStore
+		for _, uid := range uidList {
+			kv.excutedCmd[uid] = true
+		}
+		kv.uidList = uidList
+		kv.lastOpIndex = lastIncludedIndex
+		kv.lastOpTerm = lastIncludedTerm
+	}
+
+	DPrintf("Server {%d} installed snapshot\n", kv.me)
+}
+
+func (kv *KVServer) rejectAllRequest() {
+	for _, info := range kv.replyQueue {
+		info.ch <- replyMsg{err: ErrWrongLeader}
+	}
+	kv.replyQueue = []*replyInfo{}
 }
